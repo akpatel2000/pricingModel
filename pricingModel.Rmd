@@ -1,0 +1,271 @@
+---
+title: "pricingModel"
+author: "atul.patel@princetonpointcapital.com"
+date: "4/26/2018"
+output:
+  html_document: default
+  pdf_document: default
+---
+# Machine Learning Algorithms to Predict Dealer Offer-side
+## Purpose
+In this study we use a machine learning algorithm to help predict the dealer-offer side of a municipal bond.  The first obvious question is why predict the dealer's offer-side?  Here we are limited by the availability of data.  Our data come from scanning approximately 8000 email messages that contain offerings made by a single dealer.  In those emails we are searching for dealer offering runs.  While this is only a small subset of the total number of emails, they contain valuable information.  First the information comes in the same format everyday, making it easier to format and perpare for input to our alogrithm.  Second, it contains information that makes it possible to evaluate a municipal bond.  For example, the data contains CUSIP, issuer name, coupon, maturity, next call, rating, ask size, and ask yield.  This data is used to train our model to predict the appropriate offer-side of other municipal bonds.
+
+Why do this?  To prove that it can be done.  To demonstrate that there is a place for modern data science tools in the municipal bond market.  The math that makes this possible has been around for decades.  It is confluance of faster-cheaper computers and explosion of data that has made many of these technologies more effective in solving many contemporary issues.  For sure the data in this study is less than ideal.  But this is what is most readily available.  It is most likely that future iterations of this study with better quality and greater quantity of data will see improved results.  
+
+What are we doing here?  We are taking our email data set and extracting the relevant variables.  The data is then scrubbed to correct errors and omissions.  There is some pre-processing that is necessary to make the data appropriate for the algorithm we've selected.  The data is then used to train our model for prediction against a test dataset.  Finally we present our finds a the end using some basic statistics.
+
+For those unfamiliar with this format, this document was created in RMarkdown.  That means this document contains both the code and the notes for its presentation.  We have elected not to surpress the source code so that this presentation can serve as a learning tool for others.  At the same time we welcome any constructive feedback that enhance our understanding in the future.  Thank you.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Libraries and data
+```{r load, echo = FALSE, warning = FALSE, message = FALSE}
+set.seed(2018)
+
+library(XML)
+library(lubridate)
+library(timeDate)
+library(tis)
+library(RMySQL)
+library(dbConnect)
+library(httr)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+
+Sys.setenv(TZ='EST')
+```
+```{r data, echo=FALSE}
+## read file containing dealer offers
+dealerOffers <- read.csv("dealerOffers.csv", stringsAsFactors = FALSE)
+
+## read historical rates database
+db1 <- dbConnect(MySQL(), user= "root", host = "localhost", db = "dbRates", password = "Newyork@1996")
+historicalRates <- dbReadTable(db1, name = "rates")
+numberRows <- nrow(historicalRates)
+dbDisconnect(db1)
+```
+
+## Clean Data
+As with any dataset, there is a little bit of clean-up necessary before we do any analysis.
+
+Key data assumptions:
+
+ * Removed bonds below 5 years to maturity
+ * Removed bonds with less than 8 year to next call
+ * Special processing of enterprise bonds such as hospitals, power, and airports
+
+```{r clean, echo = TRUE}
+# need to process date fields
+dealerOffers$mty <- as.Date(dealerOffers$mty)
+dealerOffers$nxtCall <- as.Date(dealerOffers$nxtCall)
+dealerOffers$date <- as.Date(dealerOffers$date)
+historicalRates$date <- as.Date(historicalRates$date)
+
+# add years to maturity and next call based of date 
+dealerOffers <- dealerOffers %>% mutate(yearsToMat = as.numeric(mty - date)/365)
+dealerOffers <- dealerOffers %>% mutate(yearsToNxtCall = as.numeric(nxtCall - date)/365)
+
+# It is assumed that bonds with no next call are noncallable
+dealerOffers$yearsToNxtCall[which(is.na(dealerOffers$yearsToNxtCall))] <- 0
+
+# This model is not going to look at bond that are less than 5 years maturity
+dealerOffers <- dealerOffers %>% filter(yearsToMat >= 5)
+
+# for simplicity the model excludes calls less than 8 years 
+# future enhancements can included better test to remove kicker bonds.
+dealerOffers <- dealerOffers %>% filter(!yearsToNxtCall < 8 | yearsToNxtCall == 0)
+
+# There is some data that has incorrect yield; filtering out all yield > 8%
+dealerOffers <- dealerOffers %>% filter(askYTC < 8)
+
+# process state 
+dealerOffers$state <- as.factor(dealerOffers$state)
+dealerOffers$state <- as.numeric(dealerOffers$state)
+
+# change ratings to numeric value so Aaa = 1, Aa1 = 2, Aa2 = 3 etc
+# Note there is no D rating for Moodys -- 
+# So S&P rating scale needs to be adjusted to have 21 (C&D are same)
+moodysDF <- data.frame(rating = c("Aaa", "Aa1", "Aa2", "Aa3",
+                                  "A1", "A2", "A3",
+                                  "Baa1", "Baa2", "Baa3",
+                                  "Ba1", "Ba2", "Ba3",
+                                  "B1", "B2", "B3",
+                                  "Caa1", "Caa2", "Caa3",
+                                  "Ca", "C"), 
+                       ratingValue = c(1:21))
+
+spDF <- data.frame(rating = c("AAA", "AA+", "AA", "AA-",
+                                  "A+", "A", "A-",
+                                  "BBB+", "BBB", "BBB-",
+                                  "BB+", "BB", "BB-",
+                                  "B+", "B", "B-",
+                                  "CCC+", "CCC", "CCC-",
+                                  "CC", "C","D"), 
+                       ratingValue = c(1:21,21))
+
+# Null ratings rating different forms in the data
+nullRatings <- c("N.A.", "NA", "NR")
+
+# Change nullRatings to NA 
+x <- which(dealerOffers$moody %in% nullRatings)
+dealerOffers$moody[x] <- NA
+x <- which(dealerOffers$sp %in% nullRatings)
+dealerOffers$sp[x] <- NA
+
+# We are going to operate on model that must have moodys rating
+dealerOffers <- dealerOffers %>% filter(!is.na(moody))
+
+# provide a number for each rating
+dealerOffers <- dealerOffers %>% mutate(moodyNum = NA, spNum = NA, combinedRatingNum = NA,spreadToAAAi = NA)
+
+# loop thru and populate rating number and calculate spread to interpolated benchmark
+for (i in 1:nrow(dealerOffers)) {
+    if (dealerOffers$moody[i] %in% moodysDF$rating) {
+        x <- which(moodysDF$rating == dealerOffers$moody[i])
+        dealerOffers$moodyNum[i] <- moodysDF$ratingValue[x]
+    }
+    if (dealerOffers$sp[i] %in% spDF$rating) {
+        y <- which(spDF$rating == dealerOffers$sp[i])
+        dealerOffers$spNum[i] <- spDF$ratingValue[y]
+    }
+    # Get a combined rating if both are available -- otherwise use moodys rating
+    if (!is.na(dealerOffers$moodyNum[i]) & !is.na(dealerOffers$spNum[i]))  {
+        dealerOffers$combinedRatingNum[i] <- (dealerOffers$moodyNum[i] + dealerOffers$spNum[i])/2
+    } else {
+        dealerOffers$combinedRatingNum[i] <- dealerOffers$moodyNum[i]
+    }
+    
+    # the rate is end of day -- the offer sheets are usually beginning of day
+    # taking previous day AAA
+    
+    lookupDate <- as.Date(previousBusinessDay(dealerOffers$date[i], holidays = holidays(year(dealerOffers$date[1]))))
+    if (lookupDate %in% historicalRates$date) {
+        z <- which(historicalRates$date == lookupDate)
+        # take first element because data has some duplicate entries
+        z <- z[1]
+        ## Calculate spline curve from current yield curve
+        muniCurve <- spline(c(1,2,5,10,30), 
+                            c(historicalRates$muniYield1Y[z], 
+                              historicalRates$muniYield2Y[z], 
+                              historicalRates$muniYield5Y[z], 
+                              historicalRates$muniYield10Y[z], 
+                              historicalRates$muniYield30Y[z]), 
+                            n=30, method = "natural")
+        muniCurve <- as.data.frame(muniCurve)
+        names(muniCurve) <- c("Maturity", "AAA_Yield")
+        muniCurve$AAA_Yield <- round(muniCurve$AAA_Yield, digits = 2)
+        findAAA <- dealerOffers$yearsToMat[i]
+        if (floor(findAAA) >= 30) {
+            findAAA <- 30
+        }
+        floorAAA <- muniCurve$AAA_Yield[floor(findAAA)]
+        if (findAAA %% 1 > 0) {
+            ceilingAAA <- muniCurve$AAA_Yield[ceiling(findAAA)]
+            interpolatedAAA <- ((findAAA %% 1) * (ceilingAAA - floorAAA)) + floorAAA
+        } else {
+            interpolatedAAA <- floorAAA
+        }
+        dealerOffers$spreadToAAAi[i] <- dealerOffers$askYTC[i] - interpolatedAAA
+    }
+}
+
+# some cleanup
+dealerOffers$spreadToAAAi <- round(dealerOffers$spreadToAAAi,2) * 100
+dealerOffers$yearsToMat <- round(dealerOffers$yearsToMat, 2)
+dealerOffers$yearsToNxtCall <- round(dealerOffers$yearsToNxtCall, 2)
+
+# drop records for which we cant calc a spread (possible no AAA for that day)
+dealerOffers <- dealerOffers %>% filter(!is.na(spreadToAAAi))
+
+# create a flag that catches GO, Airports, and Hospitals
+x <- grep("[A-Z]+ ST$", str_trim(dealerOffers$issuer))
+dealerOffers <- dealerOffers %>% mutate(goFlag = 0)
+dealerOffers$goFlag[x] <- 1
+
+x <- grep(" ARPT | ARPTS | AIRPORT | AIRPORTS | ARPTSR", str_trim(dealerOffers$issuer))
+dealerOffers <- dealerOffers %>% mutate(airportFlag = 0)
+dealerOffers$airportFlag[x] <- 1
+
+x <- grep(" HLT | HLTHS | HEALTH | HOSP | HOSPITAL", str_trim(dealerOffers$issuer))
+dealerOffers <- dealerOffers %>% mutate(hospitalFlag = 0)
+dealerOffers$hospitalFlag[x] <- 1
+
+x <- grep("PWR| PWRS | POWER | POWERS", str_trim(dealerOffers$issuer))
+dealerOffers <- dealerOffers %>% mutate(powerFlag = 0)
+dealerOffers$powerFlag[x] <- 1
+```
+
+## Understanding the data
+An important part of building an analytical model, is an understanding of the underlying data.  Three important factors considered here are:
+
+* Bond Coupons -- Because of the tax consequences related to municipal bonds that trade at a discount to par, coupons are an important aspect of yield evaluation.  Ideally we would like to build our model with a good distribution of coupons in our data.  However we can see from the histogram below that our data is skewed to 5% coupons.  The skew is not surprising given the historical institutional preference for 5's.
+* Ratings -- Credit ratings are an integral part of determining credit spreads, which go to determine price/yield.  The average credit rating of a municipal bond is substantially higher than those of some other fixed income product (ie corporate bonds).  As such, the distribution of credit ratings in our data described in the table below is probably adequate.  Given the lack of access to broader credit data, this a qualitative pronouncement which is approximately correct.
+* Maturity -- We look at the distribution of the maturity spectrum presented in the histogram below.  Though it is a little bit surprising to see the spike around the 20 year mark, the data is relatively well distributed, with the caveat that we purposely removed bond offering below 5 years from our dataset.
+```{r exploratory, echo = TRUE}
+
+hist(dealerOffers$CPN, col = "blue")
+sort(table(dealerOffers$moody), decreasing = TRUE)
+hist(dealerOffers$yearsToMat, col = "blue")
+```
+
+
+## Model
+After cleaning and paring the dealer offer dataset, we have 2700 individual records.  This data is further separated into a training and testing set.  We will use the first 80% of the data to teach our model how to evaluate a municipal bond.  The next 20% will be used to test the result.  In a more robust data analysis process there would be further delineation which would allow us to calibrate the algorithm, leaving a true held-out set for final results testing.  However, the purpose of this effort is more conceptual.  The goal of this study is to serve as a guideline for a more rigorous data harvesting and modeling exercise ... call it phase 2.  The model is presented with these caveats. 
+
+The selected model is somewhat simplistic and is based on euclidean math to find relationships based on proximity.  As such, the pre-processing of the data to be featured is paramount.  It is important to center and scale the data, especially when we are talking about data with significant differences in magnitude.  However, from both observation in this effort and commentary from expert practitioners, the selection of the model is not as important as data processing, manipulation, and understanding.  The right model may improve the final results, but most models will get you 80% to the correct answer.  
+
+Furthermore, the limitation to the available data, we have elected to predict the dealer offer level of a bond.  Inherit in this approach is the potential for noise in the traders offers that may not correlate with actual transactions.  All though it is assumed the bond is ultimately traded, we are not privy to these transaction.  So a bias of the transaction-to-offer spread will be noise reflected in our model accuracy.  Nonetheless the results are fairly impressive.
+
+```{r hideModel, echo = FALSE, warning = FALSE, message = FALSE}
+##########################################################################
+# Prediction section
+##########################################################################
+library(caret)
+x <- nrow(dealerOffers)
+y <- x * .80
+training <- dealerOffers[1:y,]
+testing <- dealerOffers[(y+1):x,]
+
+modelFit <- train(spreadToAAAi ~ state + CPN + combinedRatingNum + yearsToMat + yearsToNxtCall + goFlag + hospitalFlag + airportFlag,
+                  data = training,
+                  preProcess = c("center", "scale"),
+                  method = "knn")
+
+predictions <- predict(modelFit, newdata = testing)
+```
+
+## Results
+Of the 542 bonds selected to be evaluated:
+
+* Almost 90% of the data can be evaluated within 20bps of the true offer.
+* 65% within 10bps
+* 45% within 5bps
+* The median difference between the true and predicted offer level was 1.4bps.
+
+The resulting plot of the data shows some slight heteroscedasticity, as represented by the changing dispersion of the error based on the x-axis. 
+The model did substantially better when the data set was limited to just 5% coupons.  But the reality is that the trading world does not so neatly fit this criteria.  A practical approach might be to predict all bonds as if they were 5s, and make a more simplistic assumption of spread for all other coupons.  Phase 2!
+
+There are many things that need further calibration.  For example, the biggest error was on a rather simple triple-A Texas GO bond with a 4% coupon and 2036 maturity that was off by 40bps.  The inability for the model to price such a security is unacceptable.  But there may still be a practical solution given that the model is able to price within 5bps a single-A rated North Texas Tollway 4% coupon with a 2037 maturity. 
+
+All things being equal, the model could benefit from a better quality and greater quantity of data.  The process thru which the algorithm learns is heavily influenced by the variety of types of bonds it sees.  The more it sees, the more it learns.
+```{r result, echo=TRUE}
+results <- data.frame(actual = testing$spreadToAAAi, estimate = predictions)
+results <- results %>% mutate(diff = actual - estimate)
+results$estimate <- round(results$estimate, 1)
+results$diff <- round(results$diff, 1)
+
+plot(results$diff)
+
+mean(results$diff)
+median(results$diff)
+max(results$diff)
+min(results$diff)
+
+sum(results$diff < 20 & results$diff > -20)/nrow(results)
+sum(results$diff < 10 & results$diff > -10)/nrow(results)
+sum(results$diff < 5 & results$diff > -5)/nrow(results)
+
+testing <- cbind(testing, results)
+```
