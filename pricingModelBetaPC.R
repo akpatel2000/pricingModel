@@ -149,8 +149,8 @@ for (i in 1:nrow(dealerOffers)) {
 
 # some cleanup
 dealerOffers$spreadToAAAi <- round(dealerOffers$spreadToAAAi,2) * 100
-dealerOffers$yearsToMat <- round(dealerOffers$yearsToMat, 2)
-dealerOffers$yearsToNxtCall <- round(dealerOffers$yearsToNxtCall, 2)
+dealerOffers$yearsToMat <- round(dealerOffers$yearsToMat, 1)
+dealerOffers$yearsToNxtCall <- round(dealerOffers$yearsToNxtCall, 1)
 
 # drop records for which we cant calc a spread (possible no AAA for that day)
 dealerOffers <- dealerOffers %>% filter(!is.na(spreadToAAAi))
@@ -172,7 +172,7 @@ x <- grep("PWR| PWRS | POWER | POWERS", str_trim(dealerOffers$issuer))
 dealerOffers <- dealerOffers %>% mutate(powerFlag = 0)
 dealerOffers$powerFlag[x] <- 1
 
-
+# impute missing rating
 pData <- dealerOffers[,-c(1,2,3,6,7,8,9,10,11,12,13,18)]
 
 dummy.vars <- dummyVars(~., data = pData)
@@ -184,13 +184,31 @@ imputed.data <- predict(pre.process, train.dummy)
 imputed.data <- as.data.frame(imputed.data)
 dealerOffers$combinedRatingNum <- (imputed.data$moodyNum + imputed.data$spNum)/2
 dealerOffers <- dealerOffers[,-c(1,16,17)]
+dealerOffers$combinedRatingNum <- round(dealerOffers$combinedRatingNum, 1)
 
 # process state
-dealerOffers <- dealerOffers %>% mutate(stateNum = NA)
+dealerOffers <- dealerOffers %>% mutate(stateTax = NA)
 for (i in 1:nrow(stateCode)) {
   x <- which(dealerOffers$state == stateCode$Abbreviation[i])
-  dealerOffers$stateNum[x] <- stateCode$State_Code[i]
+  dealerOffers$stateTax[x] <- stateCode$State_Tax[i]
 }
+
+dealerOffers <- dealerOffers %>% mutate(matBucket = NA, callableFlag = FALSE)
+for (i in 1:nrow(dealerOffers)) {
+  if (dealerOffers$yearsToNxtCall[i] > 0) {
+    dealerOffers$callableFlag[i] <- 1
+  }
+  if (dealerOffers$yearsToMat[i] < 11) {
+    dealerOffers$matBucket[i] <- 1
+  } else {
+    if (dealerOffers$yearsToMat[i] < 21) {
+      dealerOffers$matBucket[i] <- 2 
+    } else {
+        dealerOffers$matBucket[i] <- 3
+    }
+  }
+}
+
 
 x <- nrow(dealerOffers)
 y <- x * .80
@@ -203,21 +221,20 @@ testing <- dealerOffers[(y+1):x,]
 ##########################################################################
 
 train.control <- trainControl(method = "repeatedcv",
-                              number = 10,
-                              repeats = 5,
+                              number = 2,
+                              repeats = 1,
                               search = "grid")
 
 
-modelFit <- train(spreadToAAAi ~ stateNum + CPN + combinedRatingNum + yearsToMat + yearsToNxtCall + 
+modelFit <- train(spreadToAAAi ~ stateTax + CPN + combinedRatingNum + yearsToMat + yearsToNxtCall + 
                     goFlag + hospitalFlag + airportFlag + powerFlag,
                    data = training,
                    preProcess = c("center", "scale"),
-                   method = "xgbTree",
+                   method = "rf",
                    trControl = train.control)
 
 
 predictions <- predict(modelFit, newdata = testing)
-predictions
 
 results <- data.frame(actual = testing$spreadToAAAi, estimate = predictions)
 results <- results %>% mutate(diff = actual - estimate)
